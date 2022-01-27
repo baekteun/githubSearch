@@ -1,121 +1,118 @@
 //
-//  User.swift
-//  Github
+//  Search.swift
+//  TCAGithubSearch
 //
-//  Created by 최형우 on 2022/01/27.
-//  Copyright © 2022 baegteun. All rights reserved.
+//  Created by Kang Min Ahn on 2020/05/15.
+//  Copyright © 2020 kangmin. All rights reserved.
 //
 
-import Foundation
 import ComposableArchitecture
+import SwiftUI
+import Combine
 
-
-// MARK: - API Model
-struct SearchUserResponse: Codable{
-    let items: [User]
+struct SearchState: Equatable {
+    var searchQuery = ""
+    var users: [User] = []
+    var nextUrl: URL?
 }
 
-struct User: Equatable, Codable{
-    let id: Int
-    let name: String
-    let avatarUrlString: String?
-    let repoCount: Int?
-    
-    var avatarUrl: URL? {
-        guard let avatarUrlString = avatarUrlString else { return nil }
-        return URL(string: avatarUrlString)
-    }
+enum SearchAction {
+    case searchQueryChanged(String)
+    case getNextUsers
+    case usersResponse(Result<([User], URL?), GithubClient.Failure>)
+    case updateUser(Result<User, GithubClient.Failure>, _ index: Int)
+    case appendUsers(Result<([User], URL?), GithubClient.Failure>)
 }
 
-extension User{
-    private enum CodingKeys: String, CodingKey{
-        case id
-        case name = "login"
-        case avatarUrlString = "avatar_url"
-        case repoCount = "public_repos"
-    }
+struct SearchEnvironment {
+    var githubClient: GithubClient
+    var mainQueue: AnySchedulerOf<DispatchQueue>
 }
 
-// MARK: - API Client Interface
-struct GithubClient{
-    var searchUsers: (String) -> Effect<([User], URL?), Failure>
-    var getNextUsers: (URL) -> Effect<([User], URL?), Failure>
-    var getUser: (String) -> Effect<User, Failure>
-    
-    struct Failure: Error, Equatable {}
-}
+let searchReducer = Reducer<SearchState, SearchAction, SearchEnvironment> { state, action, environment in
+    struct SearchUserId: Hashable {}
 
-// MARK: - Live API Implementation
-extension GithubClient{
-    static let live = GithubClient(
-        searchUsers: { query in
-            guard var components = URLComponents(string: "https://api.github.com/search/users") else {
-                return .init(error: Failure())
-                
-            }
-            components.queryItems = [URLQueryItem(name: "q", value: query)]
-            
-            let publisher = URLSession.shared.dataTaskPublisher(for: components.url!)
-                .share()
-            let getNextURL = publisher
-                .map { _, response in
-                    return fetchNextURL(from: response)
-                }
-                .mapError { _ in Failure() }
-            let getUsers = publisher
-                .map{ data,_ in data }
-                .decode(type: SearchUserResponse.self, decoder: JSONDecoder())
-                .map(\.items)
-                .mapError{ _ in Failure() }
-            
-            return getUsers.zip(getNextURL)
-                .eraseToEffect()
-            
-        }, getNextUsers: { url in
-            let publisher = URLSession.shared.dataTaskPublisher(for: url)
-                .share()
-            let getNextURL = publisher
-                .map{ _, response in
-                    return fetchNextURL(from: response)
-                }
-                .mapError{ _ in Failure() }
-            let getUsers = publisher
-                .map{ data,_ in data }
-                .decode(type: SearchUserResponse.self, decoder: JSONDecoder())
-                .map(\.items)
-                .mapError{ _ in Failure() }
-            
-            return getUsers.zip(getNextURL)
-                .eraseToEffect()
-        }, getUser: { userName in
-            guard let components = URLComponents(string: "https://api.github.com/users/\(userName)"),
-                  let url = components.url else {
-                      return .init(error: Failure())
-                  }
-            return URLSession.shared.dataTaskPublisher(for: url)
-                .map { data,_ in data }
-                .decode(type: User.self, decoder: JSONDecoder())
-                .mapError { _ in Failure() }
-                .eraseToEffect()
-        })
-    
-    
-    static func fetchNextURL(from response: URLResponse) -> URL?{
-        guard let response = response as? HTTPURLResponse,
-              let value = response.value(forHTTPHeaderField: "Link") else { return nil }
-        let links = value.split(separator: ",").map{ $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-        if let nextUrlString = links.filter({ $0.contains("rel=\"next") }).first?.slice(from: "<", to: ">") {
-            return URL(string: nextUrlString)
+    switch action {
+    case let .searchQueryChanged(query):
+        state.searchQuery = query
+
+        guard !query.isEmpty else {
+          state.users = []
+          return .cancel(id: SearchUserId())
         }
-        return nil
+
+        return environment.githubClient
+            .searchUsers(query)
+            .receive(on: environment.mainQueue)
+            .catchToEffect()
+            .debounce(id: SearchUserId(), for: 0.3, scheduler: environment.mainQueue)
+            .map(SearchAction.usersResponse)
+            .cancellable(id: SearchUserId(), cancelInFlight: true)
+
+    case .getNextUsers:
+        guard let nextUrl = state.nextUrl else {
+            return .none
+        
+        }
+
+        return environment.githubClient
+            .getNextUsers(nextUrl)
+            .receive(on: environment.mainQueue)
+            .catchToEffect()
+            .debounce(id: SearchUserId(), for: 0.3, scheduler: environment.mainQueue)
+            .map(SearchAction.appendUsers)
+            .cancellable(id: SearchUserId(), cancelInFlight: true)
+
+
+    case let .usersResponse(.success((users, nextUrl))):
+        struct UsersRepoCountId: Hashable {}
+        print("ASDF")
+
+        state.users = users
+        state.nextUrl = nextUrl
+
+        return Effect.merge(users.enumerated().map { index, user in
+            environment.githubClient
+                .getUser(user.name)
+                .receive(on: environment.mainQueue)
+                .catchToEffect()
+                .map { SearchAction.updateUser($0, index) }
+            })
+//            .cancellable(id: UsersRepoCountId(), cancelInFlight: true)
+
+    case let .usersResponse(.failure(error)):
+        return .none
+
+    case let .updateUser(.success(user), index):
+        state.users[index] = user
+
+        return .none
+
+    case let .updateUser(.failure(error), _):
+        return .none
+
+    case let .appendUsers(.success((users, nextUrl))):
+        state.users.append(contentsOf: users)
+        state.nextUrl = nextUrl
+
+        return Effect.merge(users.enumerated().map { index, user in
+            environment.githubClient
+                .getUser(user.name)
+                .receive(on: environment.mainQueue)
+                .catchToEffect()
+                .map { SearchAction.updateUser($0, index) }
+            })
+//            .cancellable(id: UsersRepoCountId(), cancelInFlight: true)
+    case let .appendUsers(.failure(error)):
+        return .none
     }
 }
 
-// MARK: - Mock API Implementations
-extension GithubClient{
-    static let unimplemented = GithubClient(
-        searchUsers: { _ in fatalError("Unimplemented")},
-        getNextUsers: { _ in fatalError("Unimplemented")},
-        getUser: { _ in fatalError("Unimplemented")}
-    )
+extension User {
+    var repoCountTitle: String {
+        guard let repoCount = repoCount else {
+            return "Repo Count: ..."
+        }
+        return "Repo Count: \(repoCount)"
+    }
 }
