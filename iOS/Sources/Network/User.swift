@@ -110,3 +110,12 @@ extension GithubClient{
         return nil
     }
 }
+
+// MARK: - Mock API Implementations
+extension GithubClient{
+    static let unimplemented = GithubClient(
+        searchUsers: { _ in fatalError("Unimplemented")},
+        getNextUsers: { _ in fatalError("Unimplemented")},
+        getUser: { _ in fatalError("Unimplemented")}
+    )
+}
